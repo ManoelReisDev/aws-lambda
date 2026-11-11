@@ -1,0 +1,1 @@
+{"languages":["TypeScript","SCSS"],"frameworks":["React","Express"],"packageManagers":["npm"],"buildTools":["Vite","esbuild","TypeScript"],"testTools":["node:test","tsx"],"deploymentTools":["AWS Lambda (manual)"],"importantDirectories":["src","shared","server","lambda","tests"],"recommendedDefaultSkills":["frontend-design"],"timestamp":"2026-11-11","gitCommit":null}

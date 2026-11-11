@@ -1,0 +1,12 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { processOrder, ValidationError } from '../shared/domain';
+import { handler } from '../lambda/handler';
+const event = (total = 150) => ({ id: 'evt-001', type: 'PedidoCriado', source: 'loja.checkout', data: { pedidoId: 'P-001', total } });
+test('pedido simples sem desconto', () => assert.deepEqual(processOrder(event()), { pedidoId: 'P-001', status: 'processado', desconto: '0%', totalFinal: 150 }));
+test('pedido de 300 recebe desconto de 10%', () => assert.equal(processOrder(event(300)).totalFinal, 270));
+test('limiar do desconto e arredondamento monetário', () => { assert.equal(processOrder(event(199.99)).desconto, '0%'); assert.equal(processOrder(event(200)).totalFinal, 180); assert.equal(processOrder(event(200.05)).totalFinal, 180.05); assert.equal(processOrder(event(0)).totalFinal, 0); });
+test('pedido sem identificador é rejeitado', () => assert.throws(() => processOrder({ ...event(), data: { total: 150 } }), /pedidoId/));
+test('contrato rejeita tipos, campos ausentes e valores inválidos', () => { for (const invalid of [null, [], {}, { ...event(), type: 'Outro' }, { ...event(), id: '' }, { ...event(), source: '' }, { ...event(), data: null }, { ...event(), data: { pedidoId: ' ' , total: 10 } }, ...[-1, NaN, Infinity, '150', Number.MAX_SAFE_INTEGER].map(total => ({ ...event(), data: { pedidoId: 'P', total } }))]) assert.throws(() => processOrder(invalid), ValidationError); });
+test('handler usa a mesma regra da simulação', async () => assert.deepEqual(await handler(event(300)), processOrder(event(300))));
+test('handler propaga erro de validação', async () => assert.rejects(handler({}), ValidationError));
