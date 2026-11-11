@@ -105,6 +105,96 @@ Erros de validação são rejeitados pela API antes da invocação. Para observa
 
 A duração AWS inclui a ida e volta do backend, não apenas o tempo de CPU da função. `Lambda RequestId` é extraído dos logs quando presente; `API RequestId` identifica a requisição ao serviço AWS e é exibido separadamente. `LogType: Tail` retorna até 4 KB de logs da execução.
 
+## Exemplos com SQS, SNS e EventBridge
+
+Os exemplos desta seção são evoluções possíveis do e-commerce fictício. **A implementação atual não utiliza SQS, SNS ou EventBridge:** o backend invoca a Lambda diretamente e aguarda a resposta.
+
+| Serviço | Conceito principal | Exemplo no laboratório |
+| --- | --- | --- |
+| **SQS** | Fila: guarda mensagens até serem consumidas, dentro do período de retenção configurado. | Acumular pedidos e processá-los conforme a capacidade disponível. |
+| **SNS** | Publicação e assinatura: distribui uma mensagem para vários interessados. | Avisar estoque, faturamento e notificações sobre o mesmo pedido. |
+| **EventBridge** | Barramento de eventos: encaminha eventos por regras de conteúdo. | Direcionar pedidos de valor elevado para análise e pagamentos aprovados para expedição. |
+
+### SQS: processar pedidos sem fazer o cliente esperar
+
+Imagine uma promoção que gera milhares de pedidos em poucos segundos:
+
+```text
+Checkout → Backend → Fila SQS → Lambda de pedidos
+```
+
+O backend coloca cada pedido na fila e responde **“pedido recebido para processamento”**. A Lambda processa as mensagens depois, aplicando a mesma regra de desconto do laboratório. A confirmação de envio à fila não significa que o pedido já foi processado.
+
+- **Desacoplamento temporal:** produtor e consumidor não precisam executar ao mesmo tempo.
+- **Buffer:** a fila absorve o acúmulo de mensagens durante picos.
+- **Novas tentativas:** mensagens que falham podem voltar a ficar disponíveis para processamento.
+- **Idempotência:** processar novamente o mesmo evento deve evitar efeitos duplicados, como cobrar duas vezes. O identificador do evento pode ser usado para registrar quais eventos já foram processados.
+
+Na integração com Lambda, o mapeamento de origem de eventos consulta a fila e invoca a função com lotes de mensagens. Apesar de essa invocação interna ser síncrona, o fluxo é assíncrono do ponto de vista do checkout, que não aguarda a conclusão. Pode haver processamento repetido. Uma fila de mensagens não processadas (**DLQ**), quando configurada, pode receber mensagens após o limite de tentativas definido na política da fila.
+
+O handler atual precisaria de uma adaptação: a integração SQS entrega mensagens em `event.Records`, e o JSON do pedido fica no campo `body` de cada registro. A regra de negócio de `shared/domain.ts` pode continuar sendo reutilizada.
+
+Referências: [Lambda com SQS](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html) e [configuração da fila e DLQ](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-configure-lambda-function-trigger.html).
+
+### SNS: um pedido interessa a vários sistemas
+
+Quando o pedido é criado, várias áreas precisam reagir independentemente:
+
+```text
+                         ┌→ Fila de estoque → Lambda de estoque
+Checkout → Tópico SNS ────┼→ Fila de faturamento → Lambda de faturamento
+                         └→ Fila de notificações → Lambda de e-mail
+```
+
+O checkout publica uma mensagem no tópico, e cada fila inscrita recebe uma cópia, conforme os filtros configurados.
+
+- **Publisher:** quem publica a mensagem, como o checkout.
+- **Topic:** canal de publicação, como `pedidos-criados`.
+- **Subscriber:** quem assina o tópico, como a fila de estoque.
+- **Fan-out:** distribuição de uma mensagem para vários destinos.
+
+Uma fila por área permite que cada consumidor processe em seu próprio ritmo. **Vários consumidores na mesma fila SQS disputam as mensagens; isso não garante uma cópia para cada área.** O SNS faz a distribuição entre as filas. Ele também pode entregar diretamente a outros tipos de destino, como funções Lambda.
+
+O SNS oferece filtros por assinatura, baseados nos atributos ou no corpo JSON da mensagem. Por exemplo, uma assinatura pode receber apenas pedidos de determinada categoria.
+
+Referências: [SNS com SQS](https://docs.aws.amazon.com/sns/latest/dg/sns-sqs-as-subscriber.html) e [filtros do SNS](https://docs.aws.amazon.com/sns/latest/dg/sns-message-filtering.html).
+
+### EventBridge: encaminhar eventos conforme o significado
+
+O e-commerce pode produzir vários tipos de evento:
+
+```text
+Checkout ─── PedidoCriado ──────┐
+Pagamento ── PagamentoAprovado ─┼→ EventBridge → Regras → Destinos
+Estoque ──── EstoqueEsgotado ───┘
+```
+
+| Evento e condição | Destino proposto |
+| --- | --- |
+| `PedidoCriado` | Fila de processamento de pedidos. |
+| `PedidoCriado` com total acima de R$ 1.000 | Fila de análise antifraude. |
+| `PagamentoAprovado` | Lambda que inicia a expedição. |
+| `EstoqueEsgotado` | Serviço de reposição de produtos. |
+
+- **Event bus:** barramento que recebe os eventos.
+- **Event pattern:** critérios que identificam os eventos de interesse.
+- **Rule:** associa esses critérios aos destinos.
+- **Target:** destino, como uma Lambda ou fila SQS.
+
+Um evento pode corresponder a várias regras e seguir para vários destinos. A regra seleciona os eventos; o código do consumidor executa a ação de negócio. O SNS também possui filtros: o exemplo com EventBridge enfatiza a integração de várias origens e tipos de evento em um barramento.
+
+A publicação precisaria adaptar nosso contrato ao envelope do EventBridge: o tipo pode ser informado como `DetailType`, a origem como `Source`, e os dados do evento como JSON em `Detail`. O consumidor recebe o envelope do EventBridge e extrai o evento para reutilizar a regra de negócio.
+
+Referências: [regras do EventBridge](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-rules.html) e [padrões de eventos](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-event-patterns.html).
+
+### Combinando os serviços
+
+```text
+Checkout → EventBridge → Regra PedidoCriado → SQS → Lambda
+```
+
+Nesse exemplo, **EventBridge decide o encaminhamento, SQS guarda o trabalho pendente e Lambda executa o processamento**. São responsabilidades complementares. O backend confirma a publicação; para a interface mostrar o resultado final posteriormente, seria necessário armazenar o status do processamento e disponibilizar uma forma de consultá-lo ou notificá-lo.
+
 ## Versão legível da função Lambda
 
 O arquivo `dist/lambda/index.cjs` é gerado pelo esbuild ao executar `npm run build:lambda` (ou `npm run build`). Ele reúne `lambda/handler.ts` e `shared/domain.ts` e adiciona código de compatibilidade com CommonJS. Edite os arquivos TypeScript de origem; alterações no arquivo gerado serão sobrescritas pelo próximo build.
